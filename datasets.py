@@ -7,11 +7,92 @@
 
 
 import os
+import torch
 from torchvision import datasets, transforms
+from torch.utils.data.dataset import Dataset
 
 from timm.data.constants import \
     IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
 from timm.data import create_transform
+import csv
+import numpy as np
+from PIL import Image
+
+# MIMIC dataloader, adapted from Foundation Ark
+class MIMIC(Dataset):
+
+    def __init__(self, images_path, file_path, augment=None, num_class=14,
+                 uncertain_label="Ones", unknown_label=0, annotation_percent=100):
+
+        self.img_list = []
+        self.img_label = []
+        self.augment = augment
+        assert uncertain_label in ["Ones", "Zeros", "LSR-Ones", "LSR-Zeros"]
+        self.uncertain_label = uncertain_label
+
+        with open(file_path, "r") as fileDescriptor:
+            csvReader = csv.reader(fileDescriptor)
+            next(csvReader, None)
+            for line in csvReader:
+                imagePath = os.path.join(images_path, line[0])
+                label = line[5:]
+                for i in range(num_class):
+                    if label[i]:
+                        a = float(label[i])
+                        if a == 1:
+                            label[i] = 1
+                        elif a == 0:
+                            label[i] = 0
+                        elif a == -1:  # uncertain label
+                            if self.uncertain_label == "Ones":
+                                label[i] = 1
+                            elif self.uncertain_label == "Zeros":
+                                label[i] = 0
+                            elif self.uncertain_label == "LSR-Ones":
+                                label[i] = random.uniform(0.55, 0.85)
+                            elif self.uncertain_label == "LSR-Zeros":
+                                label[i] = random.uniform(0, 0.3)
+                    else:
+                        label[i] = unknown_label  # unknown label
+
+                self.img_list.append(imagePath)
+                self.img_label.append(label)
+
+        indexes = np.arange(len(self.img_list))
+        if annotation_percent < 100:
+            random.Random(99).shuffle(indexes)
+            num_data = int(indexes.shape[0] * annotation_percent / 100.0)
+            indexes = indexes[:num_data]
+
+            _img_list, _img_label = copy.deepcopy(self.img_list), copy.deepcopy(self.img_label)
+            self.img_list = []
+            self.img_label = []
+
+            for i in indexes:
+                self.img_list.append(_img_list[i])
+                self.img_label.append(_img_label[i])
+
+    def __getitem__(self, index): 
+
+        imagePath = self.img_list[index]
+        imageData = Image.open(imagePath).convert('RGB')
+        imageLabel = torch.FloatTensor(self.img_label[index])     
+
+        if self.augment is not None: 
+            imageData = self.augment(imageData)
+        else:
+            imageData = (np.array(imageData)).astype('uint8')
+            augmented = self.train_augment(image=imageData)
+            imageData = augmented['image']
+            
+            mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+            imageData = (imageData - mean) / std
+            imageData = imageData.transpose(2, 0, 1).astype('float32')
+
+        return imageData, imageLabel
+
+    def __len__(self):
+        return len(self.img_list)
 
 def build_dataset(is_train, args):
     transform = build_transform(is_train, args)
@@ -35,6 +116,15 @@ def build_dataset(is_train, args):
         root = os.path.join(args.data_path, 'train' if is_train else 'val')
         dataset = datasets.ImageFolder(root, transform=transform)
         nb_classes = 1000
+    elif args.data_set == "MIMIC":
+        print("loading MIMIC-CXR ... creating from datapath /scratch/jliang12/data/MIMIC_jpeg/physionet.org/files/mimic-cxr-jpg/2.0.0/")
+        img_path = "/scratch/jliang12/data/MIMIC_jpeg/physionet.org/files/mimic-cxr-jpg/2.0.0/"
+        if is_train:
+            file_path = "/scratch/nralbert/CSE591/Ark/dataset/mimic-cxr-2.0.0-train.csv"
+        else:
+            file_path = "/scratch/nralbert/CSE591/Ark/dataset/mimic-cxr-2.0.0-test.csv"
+        dataset = MIMIC(img_path, file_path, augment=transform)
+        nb_classes = 14
     elif args.data_set == "image_folder":
         root = args.data_path if is_train else args.eval_data_path
         dataset = datasets.ImageFolder(root, transform=transform)

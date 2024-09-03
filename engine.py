@@ -11,6 +11,8 @@ from typing import Iterable, Optional
 import torch
 from timm.data import Mixup
 from timm.utils import accuracy, ModelEma
+from sklearn.metrics import accuracy_score, roc_auc_score
+import numpy as np
 
 import utils
 
@@ -46,7 +48,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         targets = targets.to(device, non_blocking=True)
 
         if mixup_fn is not None:
+            #print(f"\n\n[BEFORE]: samples.shape {samples.shape}")
+            #print(f"[BEFORE]: targets.shape {targets.shape}")
             samples, targets = mixup_fn(samples, targets)
+            #print(f"\n[AFTER]: samples.shape {samples.shape}")
+            #print(f"[AFTER]: targets.shape {targets.shape}")
 
         if use_amp:
             with torch.cuda.amp.autocast():
@@ -55,6 +61,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         else: # full precision
             output = model(samples)
             loss = criterion(output, targets)
+
 
         loss_value = loss.item()
 
@@ -85,7 +92,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         torch.cuda.synchronize()
 
         if mixup_fn is None:
-            class_acc = (output.max(-1)[-1] == targets).float().mean()
+            #print(f"[DEBUG]: output.shape {output.shape}")
+            #print(f"[DEBUG]: targets.shape {targets.shape}")
+            output = torch.sigmoid(output)  # Convert logits to probabilities
+            preds = (output > 0.5).float()  # Apply threshold to get binary predictions
+            class_acc = (preds == targets).float().mean()  # Calculate mean accuracy
         else:
             class_acc = None
         metric_logger.update(loss=loss_value)
@@ -136,13 +147,18 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 @torch.no_grad()
 def evaluate(data_loader, model, device, use_amp=False):
-    criterion = torch.nn.CrossEntropyLoss()
+
+    # criterion = torch.nn.CrossEntropyLoss()
+    criterion = torch.nn.BCEWithLogitsLoss() # updated for multi-label classification (MIMIC-CXR)
 
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Test:'
 
     # switch to evaluation mode
     model.eval()
+    all_preds = []
+    all_targets = []
+
     for batch in metric_logger.log_every(data_loader, 10, header):
         images = batch[0]
         target = batch[-1]
@@ -159,15 +175,38 @@ def evaluate(data_loader, model, device, use_amp=False):
             output = model(images)
             loss = criterion(output, target)
 
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        #acc1, acc5 = accuracy(output, target, topk=(1, 5))
+
+        #batch_size = images.shape[0]
+        #metric_logger.update(loss=loss.item())
+        #metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
+        #metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
+
+        preds = torch.sigmoid(output).cpu().numpy()  # For multi-label, apply sigmoid to get probabilities
+        all_preds.append(preds)
+        all_targets.append(target.cpu().numpy())
 
         batch_size = images.shape[0]
         metric_logger.update(loss=loss.item())
-        metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
-        metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
-    # gather the stats from all processes
-    metric_logger.synchronize_between_processes()
-    print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
-          .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
 
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    all_preds = np.concatenate(all_preds)
+    all_targets = np.concatenate(all_targets)
+
+    # gather the stats from all processes
+    #metric_logger.synchronize_between_processes()
+    #print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
+          #.format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
+
+    # Calculate metrics for multi-label classification
+    accuracy = accuracy_score(all_targets, all_preds.round())
+    auc = roc_auc_score(all_targets, all_preds, average='macro')
+
+    print(f'* Accuracy {accuracy:.3f} AUC {auc:.3f} loss {metric_logger.loss.global_avg:.3f}')
+
+    #return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
+    return {
+        'accuracy': accuracy,
+        'auc': auc,
+        'loss': metric_logger.loss.global_avg
+    }
